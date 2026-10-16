@@ -1,8 +1,6 @@
 #include "PCH.h"
 #include "framework.h"
-#define TOML_EXCEPTIONS 0
 #include <toml++/toml.h>
-#include "Expression.h"
 
 void Loki::DynamicAnimationCasting::ReadToml(std::filesystem::path path) {
     logger::info("Reading {}...", path.string());
@@ -103,20 +101,25 @@ void Loki::DynamicAnimationCasting::ReadToml(std::filesystem::path path) {
         }
     };
 
-    toml::parse_result file;
+    toml::table file;
     try {
         file = toml::parse_file(path.c_str());
     } catch (const toml::parse_error& e) {
-        logger::error("Error parsing file '{}':\t{}\n\t\t({}:{})", *e.source().path, e.description(),
+        logger::error("Error parsing file '{}':\t{}\n\t\t({}:{})", path.string(), e.description(),
                       e.source().begin.line, e.source().begin.column);
         return;
-    } 
-    
+    }
+
     CastTriggers.reserve(1024);
     logger::info("Start : {}", path.string());
-    if (auto arr = file.table().get_as<toml::array>("event")) {
+    if (auto arr = file.get_as<toml::array>("event")) {
         for (const auto& elem : *arr) {
-            const auto& event = *elem.as_table();
+            const auto* eventTable = elem.as_table();
+            if (!eventTable) {
+                logger::error("Skipping malformed [[event]] entry in {}", path.string());
+                continue;
+            }
+            const auto& event = *eventTable;
             using std::string;
 
             if (CastTriggers.size() == CastTriggers.capacity()) {
@@ -126,13 +129,17 @@ void Loki::DynamicAnimationCasting::ReadToml(std::filesystem::path path) {
 
             auto& trigger = CastTriggers.emplace_back();
             trigger.tag = event["AnimationEvent"].value_or(empty_string);
-            logger::info("- Cast Trigger [{}]", trigger.tag);
+            logger::info("- Cast Trigger [{}]", trigger.tag.c_str());
 
             auto exGroupName = event["ExclusiveGroup"].value_or(empty_string);
             if (!exGroupName.empty()) {
-                trigger.group = ExclusiveGroups.try_emplace(std::move(exGroupName), static_cast<int>(exGroupName.size())).first->second;
-                if (trigger.group > MaxExclusiveGroups) {
-                    logger::error("Number of exclusive groups overflow (>{}), ignore group {}...", MaxExclusiveGroups, exGroupName);
+                if (auto itr = ExclusiveGroups.find(exGroupName); itr != ExclusiveGroups.end()) {
+                    trigger.group = itr->second;
+                } else if (ExclusiveGroups.size() < MaxExclusiveGroups) {
+                    trigger.group = static_cast<int>(ExclusiveGroups.size());
+                    ExclusiveGroups.emplace(exGroupName, trigger.group);
+                } else {
+                    logger::error("Number of exclusive groups overflow (>={}), ignore group {}...", MaxExclusiveGroups, exGroupName);
                     trigger.group = -1;
                 }
             }
@@ -385,13 +392,19 @@ bool Loki::DynamicAnimationCasting::RegisterCustomSpell(RE::BSFixedString a_name
 }
 
 int Loki::DynamicAnimationCasting::SetMagicFavourite(int Index) {
-    const auto& favSpells = RE::MagicFavorites::GetSingleton()->spells;
-    if (Index < 0 || Index >= favSpells.size()) {
+    auto* favourites = RE::MagicFavorites::GetSingleton();
+    if (!favourites) {
+        MagicFavouriteIndex = -1;
+        return MagicFavouriteIndex;
+    }
+    const auto& favSpells = favourites->spells;
+    RE::TESForm* selected = (Index >= 0 && Index < static_cast<int>(favSpells.size())) ? favSpells[Index] : nullptr;
+    if (!selected) {
         MagicFavouriteIndex = -1;
         RE::DebugNotification("Selected Spell : None");
     } else {
         MagicFavouriteIndex = Index;
-        auto message = fmt::format("Selected Spell : {}", favSpells[Index]->GetName());
+        auto message = fmt::format("Selected Spell : {}", selected->GetName());
         RE::DebugNotification(message.c_str());
     }
     return MagicFavouriteIndex;
@@ -399,11 +412,15 @@ int Loki::DynamicAnimationCasting::SetMagicFavourite(int Index) {
 
 int Loki::DynamicAnimationCasting::NextMagicFavourite(int Delta) {
     logger::info("NextMagicFavourite");
-    const auto& favSpells = RE::MagicFavorites::GetSingleton()->spells;
+    auto* favourites = RE::MagicFavorites::GetSingleton();
+    if (!favourites) {
+        return MagicFavouriteIndex;
+    }
+    const auto& favSpells = favourites->spells;
     const int nFavSpells = static_cast<int>(favSpells.size()) + 1;
     for (int i = Delta; std::abs(i) < nFavSpells; i += (Delta < 0 ? -1 : +1)) {
         int favIndex = (DynamicAnimationCasting::MagicFavouriteIndex + i + nFavSpells) % nFavSpells;
-        if (favIndex == nFavSpells - 1 || favSpells[favIndex]->As<RE::MagicItem>()) 
+        if (favIndex == nFavSpells - 1 || (favSpells[favIndex] && favSpells[favIndex]->As<RE::MagicItem>()))
         {
             SetMagicFavourite(favIndex);
             break;
@@ -463,8 +480,14 @@ void Loki::DynamicAnimationCasting::OnGameSaved(SKSE::SerializationInterface* se
 }
 
 inline std::string& ReadString(SKSE::SerializationInterface* serde, std::string& outStr) {
-    int sz;
+    static constexpr int MaxNameLength = 0x4000;
+    int sz = 0;
     serde->ReadRecordData(sz);
+    if (sz < 0 || sz > MaxNameLength) {
+        logger::error("Invalid string length {} in cosave, aborting read.", sz);
+        outStr.clear();
+        return outStr;
+    }
     outStr.resize_and_overwrite(sz, [&](char* buf, std::size_t bufSize) {
         serde->ReadRecordData(buf, sz);
         return sz;
@@ -489,8 +512,12 @@ void Loki::DynamicAnimationCasting::OnGameLoaded(SKSE::SerializationInterface* s
         if (type == CustomSpellRecord) {
             serde->ReadRecordData(MagicFavouriteIndex);
             // First read how many items follow in this record, so we know how many times to iterate.
-            int customSpellSize;
+            int customSpellSize = 0;
             serde->ReadRecordData(customSpellSize);
+            if (customSpellSize < 0 || customSpellSize > 0x10000) {
+                logger::error("Invalid custom spell count {} in cosave, skipping record.", customSpellSize);
+                continue;
+            }
             // Iterate over the remaining data in the record.
             for (; customSpellSize > 0; --customSpellSize) {
                 ReadString(serde, name);

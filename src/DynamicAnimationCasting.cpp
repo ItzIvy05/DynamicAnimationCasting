@@ -8,6 +8,19 @@ void Loki::HUD::FlashHUDMeter(RE::ActorValue a_av) {
     return FlashHUDMenuMeter(a_av);
 }
 
+static constexpr RE::FormID PlayerFormID = 0x14;
+
+static void FlashHUDMeterForActor(const RE::Actor* a_actor, RE::ActorValue a_av) {
+    if (!a_actor || a_actor->formID != PlayerFormID) {
+        return;
+    }
+    if (auto* task = SKSE::GetTaskInterface()) {
+        task->AddTask([a_av] { Loki::HUD::FlashHUDMeter(a_av); });
+    } else {
+        Loki::HUD::FlashHUDMeter(a_av);
+    }
+}
+
 RE::EnchantmentItem* GetEquipedObjectEnchantment(RE::Actor* actor, int hand) 
 {
     RE::EnchantmentItem* enchantment = nullptr;
@@ -90,7 +103,7 @@ std::int8_t GetEquipmentType(RE::TESForm* equipment)
         return kSpell;  // Spell or Scroll as 10th weapon type
     } else if (equipment->As<RE::TESObjectARMO>()) {
         return kShield;
-    } else if (equipment->As<RE::TESObjectARMO>()) {
+    } else if (equipment->As<RE::TESObjectLIGH>()) {
         return kTorch;
     }
     return -1;
@@ -115,7 +128,7 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
 
     // faster rejection for player only event
     if (!CheckFormID(caster, [&]() { return actor->formID; }) ||
-        !CheckFormID(race, [&] { return actor->GetRace()->formID; })) {
+        !CheckFormID(race, [&] { auto* r = actor->GetRace(); return r ? r->formID : 0; })) {
         return false;
     }
 
@@ -143,18 +156,18 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
     const RE::Actor::ACTOR_RUNTIME_DATA& actorRD = actor->GetActorRuntimeData();
 
     if (staminaCost > 0.f && actorAV->GetActorValue(RE::ActorValue::kStamina) < staminaCost) {
-        HUD::FlashHUDMeter(RE::ActorValue::kStamina);
+        FlashHUDMeterForActor(actor, RE::ActorValue::kStamina);
         return false;
     }
 
     if (healthCost > 0.f && actorAV->GetActorValue(RE::ActorValue::kHealth) < healthCost) {
-        HUD::FlashHUDMeter(RE::ActorValue::kHealth);
+        FlashHUDMeterForActor(actor, RE::ActorValue::kHealth);
         return false;
     }
 
     float actorMagicka = actorAV->GetActorValue(RE::ActorValue::kMagicka);
     if (magickaCost > 0.f && actorMagicka < magickaCost) {
-        HUD::FlashHUDMeter(RE::ActorValue::kMagicka);
+        FlashHUDMeterForActor(actor, RE::ActorValue::kMagicka);
         return false;
     }
 
@@ -187,7 +200,10 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
 
         auto magicCaster = actor->GetMagicCaster(source);
         if (!magicCaster) return false;
-        
+
+        RE::ActorMagicCaster* overriddenCaster = nullptr;
+        RE::NiNode* previousMagicNode = nullptr;
+
         // Casting from weapon tip
         magicCaster->SetDualCasting(dual_casting);
         if (std::to_underlying(source) < 2) {
@@ -204,12 +220,28 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
                                     }
                                 }
                             }
+                            overriddenCaster = actorMagicCaster;
+                            previousMagicNode = actorMagicCaster->magicNode;
                             actorMagicCaster->magicNode = weapNode;
                         }
                     }
                 }
             }
         }
+
+        struct CasterStateRestorer {
+            RE::MagicCaster* caster;
+            RE::ActorMagicCaster* overridden;
+            RE::NiNode* previousNode;
+            ~CasterStateRestorer() {
+                if (overridden) {
+                    overridden->magicNode = previousNode;
+                }
+                if (caster) {
+                    caster->SetDualCasting(false);
+                }
+            }
+        } restorer{magicCaster, overriddenCaster, previousMagicNode};
 
         int casted = 0;
 
@@ -223,7 +255,7 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
 
             float spellCost = spell->CalculateMagickaCost(actor) * this->castMagickaCostFactor;
             if (actorMagicka < totalMagikaCost + spellCost) {
-                HUD::FlashHUDMeter(RE::ActorValue::kMagicka);
+                FlashHUDMeterForActor(actor, RE::ActorValue::kMagicka);
                 return false;
             }
             totalMagikaCost += spellCost;
@@ -264,10 +296,14 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
         };
 
         auto GetPlayerFavouriteSpell = []() -> RE::MagicItem* {
-            const auto& favSpells = RE::MagicFavorites::GetSingleton()->spells;
+            auto* favourites = RE::MagicFavorites::GetSingleton();
+            if (!favourites) return nullptr;
+            const auto& favSpells = favourites->spells;
             int favIndex = DynamicAnimationCasting::MagicFavouriteIndex;
-            if (favIndex >= 0) {
-                return favSpells[favIndex % favSpells.size()]->As<RE::MagicItem>();
+            if (favIndex >= 0 && !favSpells.empty()) {
+                if (auto* form = favSpells[favIndex % favSpells.size()]) {
+                    return form->As<RE::MagicItem>();
+                }
             }
             return nullptr;
         };
@@ -294,7 +330,6 @@ bool Loki::AnimationCasting::CastTrigger::Invoke(const RE::Actor* a_caster)
             if (castOnlyOneSpell && casted) goto CAST_SPELLS_END;
         }
 
-        static constexpr RE::FormID PlayerFormID = 0x14;
         if (castFaviouriteMagic) {
             RE::MagicItem* spell = nullptr;
             if (actor->formID == PlayerFormID) {
